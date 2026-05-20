@@ -1,4 +1,4 @@
-﻿package com.example.touchengine
+package com.example.touchengine
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
@@ -146,24 +146,93 @@ class TouchEngineService : AccessibilityService() {
         }
     }
 
-    /** 查找当前焦点所在的可滚动容器，用于方案A */
+    /** 判断可滚动容器是否支持在给定方向上滚动 */
+    private fun supportsScrollDirection(node: AccessibilityNodeInfo, dir: ScrollDir): Boolean {
+        val actions = node.actionList.map { it.id }
+        
+        // 1. 优先检查 API 21+ 明确的方向性 Action
+        val hasScrollUp    = android.view.accessibility.AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_UP.id in actions
+        val hasScrollDown  = android.view.accessibility.AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_DOWN.id in actions
+        val hasScrollLeft  = android.view.accessibility.AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_LEFT.id in actions
+        val hasScrollRight = android.view.accessibility.AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_RIGHT.id in actions
+
+        val hasVerticalActions   = hasScrollUp || hasScrollDown
+        val hasHorizontalActions = hasScrollLeft || hasScrollRight
+
+        // 2. 如果存在方向性 Action，则按其指示返回
+        if (hasVerticalActions || hasHorizontalActions) {
+            return when (dir) {
+                ScrollDir.UP    -> hasScrollUp
+                ScrollDir.DOWN  -> hasScrollDown
+                ScrollDir.LEFT  -> hasScrollLeft
+                ScrollDir.RIGHT -> hasScrollRight
+            }
+        }
+
+        // 3. 兜底方案：如果只暴露了通用的 ACTION_SCROLL_FORWARD / ACTION_SCROLL_BACKWARD
+        val hasForward  = android.view.accessibility.AccessibilityNodeInfo.ACTION_SCROLL_FORWARD in actions
+        val hasBackward = android.view.accessibility.AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD in actions
+        if (!hasForward && !hasBackward) {
+            return false
+        }
+
+        // 通过类名来排除不支持的滚动方向
+        val className = node.className?.toString() ?: ""
+        
+        val isHorizontalClass = className.contains("HorizontalScrollView", ignoreCase = true) ||
+                                className.contains("ViewPager", ignoreCase = true) ||
+                                className.contains("Workspace", ignoreCase = true)
+
+        val isVerticalClass   = className.contains("ScrollView", ignoreCase = true) ||
+                                className.contains("ListView", ignoreCase = true) ||
+                                className.contains("GridView", ignoreCase = true)
+
+        return when (dir) {
+            ScrollDir.UP    -> hasBackward && !isHorizontalClass
+            ScrollDir.DOWN  -> hasForward && !isHorizontalClass
+            ScrollDir.LEFT  -> hasBackward && !isVerticalClass
+            ScrollDir.RIGHT -> hasForward && !isVerticalClass
+        }
+    }
+
+    /** 获取应该在该可滚动容器上执行的具体 Action ID */
+    private fun getScrollActionId(node: AccessibilityNodeInfo, dir: ScrollDir): Int? {
+        val actions = node.actionList.map { it.id }
+        
+        // 优先使用明确的方向 Action
+        val specificAction = when (dir) {
+            ScrollDir.UP    -> android.view.accessibility.AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_UP
+            ScrollDir.DOWN  -> android.view.accessibility.AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_DOWN
+            ScrollDir.LEFT  -> android.view.accessibility.AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_LEFT
+            ScrollDir.RIGHT -> android.view.accessibility.AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_RIGHT
+        }
+        if (specificAction.id in actions) {
+            return specificAction.id
+        }
+
+        // 其次使用通用 Action 兜底
+        val fallbackActionId = when (dir) {
+            ScrollDir.DOWN, ScrollDir.RIGHT -> android.view.accessibility.AccessibilityNodeInfo.ACTION_SCROLL_FORWARD
+            ScrollDir.UP,  ScrollDir.LEFT   -> android.view.accessibility.AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD
+        }
+        if (fallbackActionId in actions) {
+            return fallbackActionId
+        }
+
+        return null
+    }
+
+    /** 查找当前焦点所在的可滚动容器，支持方向隔离 */
     private fun findScrollableNode(dir: ScrollDir): AccessibilityNodeInfo? {
         val root = rootInActiveWindow ?: return null
         try {
-            val action = when (dir) {
-                ScrollDir.DOWN, ScrollDir.RIGHT -> AccessibilityNodeInfo.ACTION_SCROLL_FORWARD
-                ScrollDir.UP,  ScrollDir.LEFT   -> AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD
-            }
-            // BFS 查找最近的可滚动容器
+            // BFS 查找最近的、且支持对应滚动方向的可滚动容器
             val queue = ArrayDeque<AccessibilityNodeInfo>()
             queue.add(root)
             while (queue.isNotEmpty()) {
                 val node = queue.removeFirst()
-                if (node.isScrollable) {
-                    val actions = node.actionList.map { it.id }
-                    if (action in actions) {
-                        return AccessibilityNodeInfo.obtain(node)
-                    }
+                if (node.isScrollable && supportsScrollDirection(node, dir)) {
+                    return AccessibilityNodeInfo.obtain(node)
                 }
                 for (i in 0 until node.childCount) {
                     node.getChild(i)?.let { queue.add(it) }
@@ -178,11 +247,11 @@ class TouchEngineService : AccessibilityService() {
     /** 执行方案A（ACTION_SCROLL），返回是否成功 */
     private fun tryPlanA(dir: ScrollDir): Boolean {
         val scrollNode = findScrollableNode(dir) ?: return false
-        val action = when (dir) {
-            ScrollDir.DOWN, ScrollDir.RIGHT -> AccessibilityNodeInfo.ACTION_SCROLL_FORWARD
-            ScrollDir.UP,  ScrollDir.LEFT   -> AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD
+        val actionId = getScrollActionId(scrollNode, dir) ?: run {
+            scrollNode.recycle()
+            return false
         }
-        val success = scrollNode.performAction(action)
+        val success = scrollNode.performAction(actionId)
         scrollNode.recycle()
         return success
     }
