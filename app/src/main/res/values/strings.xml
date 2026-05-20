@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">TouchEngine</string>
+    <string name="accessibility_service_description">TouchEngine accessibility service</string>
+</resources>

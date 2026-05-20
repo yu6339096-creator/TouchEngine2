@@ -1,0 +1,27 @@
+# Built-in Gradle ignores
+.gradle
+.gradle-local
+.gradle-user-home
+
+# Project specific ignores
+/local.properties
+/build
+/app/build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+
+# Android Studio / IntelliJ ignores
+*.iml
+.idea
+.idea/caches
+.idea/libraries
+.idea/modules.xml
+.idea/workspace.xml
+.idea/navEditor.xml
+.idea/assetWizardSettings.xml
+
+# System ignores
+.DS_Store
+Thumbs.db
