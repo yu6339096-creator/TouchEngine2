@@ -15,8 +15,8 @@ data class ScrollConfig(
     /** 方案A等待时间（毫秒）：到边缘后等多久尝试 ACTION_SCROLL */
     val scrollTriggerDelayMs: Long = 600L,
 
-    /** 提示显示时间（毫秒）：方案A失败后提示条显示多久再触发方案B */
-    val hintDurationMs: Long = 1500L,
+    /** 提示显示时间（毫秒）：按住边缘后倒计时多久再执行翻页/滑动 */
+    val hintDurationMs: Long = 500L,
 
     /** 方案B灵敏度倍率：控制单次模拟滑动的距离（0.5 = 半屏，1.0 = 全屏）*/
     val scrollSensitivity: Float = 0.5f,
@@ -25,7 +25,7 @@ data class ScrollConfig(
     val scrollGestureDurationMs: Long = 300L,
 
     /** 连续几帧 findBestNeighbor=null 才判定为"到边缘了" */
-    val edgeTriggerFrames: Int = 6
+    val edgeTriggerFrames: Int = 10
 ) {
     companion object {
         private const val PREFS_NAME = "TouchEnginePrefs"
@@ -43,7 +43,7 @@ data class ScrollConfig(
             return ScrollConfig(
                 autoScrollEnabled     = prefs.getBoolean(KEY_AUTO_SCROLL_ENABLED, true),
                 scrollTriggerDelayMs  = prefs.getLong(KEY_SCROLL_TRIGGER_DELAY, 600L),
-                hintDurationMs        = prefs.getLong(KEY_HINT_DURATION, 1500L),
+                hintDurationMs        = prefs.getLong(KEY_HINT_DURATION, 800L),
                 scrollSensitivity     = prefs.getFloat(KEY_SCROLL_SENSITIVITY, 0.5f),
                 scrollGestureDurationMs = prefs.getLong(KEY_SCROLL_GESTURE_DURATION, 300L),
                 edgeTriggerFrames     = prefs.getInt(KEY_EDGE_TRIGGER_FRAMES, 6)

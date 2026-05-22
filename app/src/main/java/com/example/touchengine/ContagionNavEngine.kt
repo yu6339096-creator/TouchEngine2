@@ -23,6 +23,7 @@ import kotlin.math.pow
  *  - 转向太灵敏      → 增大 DIR_RESET_DEG
  *  - 转向太迟钝      → 减小 DIR_RESET_DEG
  */
+
 // 导航引擎返回结果
 data class DragResult(
     val node: NavNode,      // 本帧应高亮的节点
@@ -31,27 +32,20 @@ data class DragResult(
 )
 
 class ContagionNavEngine {
-
     // ── 确认延迟 ──────────────────────────────────────────
     var PRE_DELAY_MS: Long = 80L
-
     // ── 加速系统 ──────────────────────────────────────────
     var ACCEL_DURATION_MS: Long = 800L
     var INTERVAL_SLOW_MS: Long  = 500L
     var INTERVAL_FAST_MS: Long  = 100L
-
     // ── 点拨判定 ──────────────────────────────────────────
     var FLICK_WINDOW_MS: Long = 300L
-
     // ── 摇杆死区 ──────────────────────────────────────────
     var DEAD_ZONE_RATIO: Float = 0.28f
-
     // ── 扇区角度 ──────────────────────────────────────────
     var CONE_HALF_ANGLE: Double = 45.0
-
     // ── 转向重置 ──────────────────────────────────────────
     var DIR_RESET_DEG: Double = 35.0
-
     // ── 内部状态 ──────────────────────────────────────────
     private var pressing       = false
     private var pressStartTime = 0L
@@ -114,8 +108,8 @@ class ContagionNavEngine {
             lastJumpTime   = now
             val next = findBestNeighbor(currentNode, lockedAngle)
             return DragResult(
-                node       = next ?: currentNode,
-                atEdge     = next == null,
+                node        = next ?: currentNode,
+                atEdge      = next == null,
                 intentAngle = lockedAngle
             )
         }
@@ -209,6 +203,11 @@ class ContagionNavEngine {
 //   - 每个扇区内只保留距离最近的那个节点作为邻居
 //   - 彻底解决稀疏布局下邻居数量不足的问题
 //   - 同时天然避免了"跨越中间节点直连远端"的问题
+//
+// [FIX 5] 新增 windowId 同窗口过滤：
+//   - 只在属于同一个窗口的节点之间建边
+//   - 防止弹窗后面的 App 节点被误选（弹窗穿透）
+//   - 防止摇杆在弹窗和底部 App 节点之间乱跳
 // ═══════════════════════════════════════════════════════════════
 object NavMeshBuilder {
 
@@ -216,11 +215,15 @@ object NavMeshBuilder {
      * 构建邻居图。
      *
      * 策略：8方向扇区，每个方向只保留最近的邻居节点。
+     * 同窗口隔离：不同 windowId 的节点之间不建边。
      *
      * @param nodes          当前屏幕上所有可点击节点
      * @param maxConnectDist 视野上限（像素），超出范围的节点不考虑
      */
     fun build(nodes: List<NavNode>, maxConnectDist: Float = 600f) {
+        // 检测是否有多个不同windowId（即有弹窗），有弹窗才隔离，没弹窗允许跨window建边
+        val windowIds = nodes.map { it.windowId }.toSet()
+        val strictWindowIsolation = windowIds.size > 1
         for (a in nodes) {
             a.neighbors.clear()
 
@@ -230,13 +233,16 @@ object NavMeshBuilder {
 
             for (b in nodes) {
                 if (a === b) continue
+                // [FIX 5] 只在同一窗口内建边，防止跨窗口焦点穿透
+                if (strictWindowIsolation && b.windowId != a.windowId) continue
+
                 val dx   = b.centerX - a.centerX
                 val dy   = b.centerY - a.centerY
                 val dist = hypot(dx.toDouble(), dy.toDouble()).toFloat()
                 if (dist >= maxConnectDist) continue
 
                 // 计算方向角（-180 ~ 180）→ 扇区索引（0 ~ 7）
-                val angleDeg = Math.toDegrees(atan2(dy.toDouble(), dx.toDouble()))
+                val angleDeg  = Math.toDegrees(atan2(dy.toDouble(), dx.toDouble()))
                 val sectorIdx = (((angleDeg + 180 + 22.5) / 45).toInt()) % 8
 
                 val current = sectorBest[sectorIdx]

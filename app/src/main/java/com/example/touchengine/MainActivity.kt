@@ -121,10 +121,10 @@ fun MainAppScreen() {
 
     var selectedTab by remember { mutableIntStateOf(0) }
 
-    var isServiceRunning by remember { mutableStateOf(true) }
+    var isServiceRunning by remember { mutableStateOf(sharedPrefs.getBoolean("service_running", true)) }
     var selectedAlgorithm by remember { mutableIntStateOf(0) }
-    var ballSize by remember { mutableFloatStateOf(0.65f) }
-    var ballOpacity by remember { mutableFloatStateOf(0.80f) }
+    var ballSize    by remember { mutableFloatStateOf(sharedPrefs.getFloat("ball_size", 0.65f)) }
+    var ballOpacity by remember { mutableFloatStateOf(sharedPrefs.getFloat("ball_opacity", 0.80f)) }
 
     var accentColor by remember { mutableStateOf(Color(0xFF2E6BFF)) }
 
@@ -179,7 +179,11 @@ fun MainAppScreen() {
                     openAccessibilitySettings = {
                         accessibilityLauncher.launch(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
                     },
-                    onRunningChange = { isServiceRunning = it },
+                    onRunningChange = {
+                        isServiceRunning = it
+                        sharedPrefs.edit().putBoolean("service_running", it).apply()
+                        TouchEngineService.liveEnabled.value = it
+                    },
                     navigateToTab = { selectedTab = it }
                 )
 
@@ -196,8 +200,16 @@ fun MainAppScreen() {
                     ballOpacity,
                     accentColor,
                     colorOptions,
-                    onSizeChange = { ballSize = it },
-                    onOpacityChange = { ballOpacity = it },
+                    onSizeChange = {
+                        ballSize = it
+                        sharedPrefs.edit().putFloat("ball_size", it).apply()
+                        TouchEngineService.liveBallSize.floatValue = it
+                    },
+                    onOpacityChange = {
+                        ballOpacity = it
+                        sharedPrefs.edit().putFloat("ball_opacity", it).apply()
+                        TouchEngineService.liveBallOpacity.floatValue = it
+                    },
                     onColorChange = { accentColor = it }
                 )
 
@@ -281,18 +293,8 @@ fun ModeScreen(isEnabled: Boolean, selectedAlgorithm: Int, accentColor: Color, o
 
         AlgorithmCard(title = "空间节点跳跃", icon = Icons.Rounded.GridView, isSelected = selectedAlgorithm == 0, enabled = isEnabled, accentColor = accentColor, onClick = { if(isEnabled) onAlgorithmChange(0) })
         Spacer(modifier = Modifier.height(16.dp))
-        AlgorithmCard(title = "磁性虚拟指针", icon = Icons.Rounded.AdsClick, isSelected = selectedAlgorithm == 1, enabled = isEnabled, accentColor = accentColor, onClick = { if(isEnabled) onAlgorithmChange(1) })
+        AlgorithmCard(title = "磁性虚拟指针（开发中）", icon = Icons.Rounded.AdsClick, isSelected = false, enabled = false, accentColor = accentColor, onClick = { })
 
-        Spacer(modifier = Modifier.height(32.dp))
-        Text(text = "动态灵敏度", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = Color.DarkGray)
-        Spacer(modifier = Modifier.height(12.dp))
-        Card(shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = Color.White)) {
-            Column(modifier = Modifier.padding(20.dp)) {
-                SliderRow(label = "狙击模式", value = 0.35f, accentColor = accentColor, enabled = isEnabled)
-                Spacer(modifier = Modifier.height(16.dp))
-                SliderRow(label = "冲刺模式", value = 0.85f, accentColor = accentColor, enabled = isEnabled)
-            }
-        }
     }
 }
 
