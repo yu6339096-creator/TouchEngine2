@@ -767,7 +767,6 @@ class TouchEngineService : AccessibilityService() {
             finally { root.recycle() }
         } else {
             val sortedWins = wins.sortedByDescending { it.layer }
-            var foundAppWindow = false
             for (window in sortedWins) {
                 // 跳过状态栏、导航栏等系统装饰窗口
                 if (window.type == AccessibilityWindowInfo.TYPE_SYSTEM) continue
@@ -785,14 +784,79 @@ class TouchEngineService : AccessibilityService() {
                 } finally {
                     root.recycle()
                 }
-                // 遇到 App 主窗口后停止，不再往下翻被完全遮挡的窗口
-                if (window.type == AccessibilityWindowInfo.TYPE_APPLICATION) {
-                    if (foundAppWindow) break
-                    foundAppWindow = true
-                }
             }
         }
         return allNodes
+    }
+
+    /**
+     * 极速探测一个节点下是否包含至少 2 个独立可见的可点击子节点。
+     */
+    private fun hasMultipleClickableChildren(node: AccessibilityNodeInfo): Boolean {
+        var count = 0
+        fun check(n: AccessibilityNodeInfo): Boolean {
+            for (i in 0 until n.childCount) {
+                val child = n.getChild(i) ?: continue
+                try {
+                    if (child.isVisibleToUser && child.isClickable) {
+                        count++
+                        if (count >= 2) return true
+                    }
+                    if (check(child)) return true
+                } finally {
+                    child.recycle()
+                }
+            }
+            return false
+        }
+        return check(node)
+    }
+
+    /**
+     * 判断一个节点是否是微信的聊天列表项或菜单项等列表行（专克微信无障碍加密）。
+     * 仅对微信生效，严格进行包名、物理长宽比、组件类型和文本内容的多维校验，确保极高精确度。
+     */
+    private fun isWeChatListItem(node: AccessibilityNodeInfo): Boolean {
+        if (node.packageName?.toString() != "com.tencent.mm") return false
+        val className = node.className?.toString() ?: ""
+        // 排除基本的可交互或叶子节点类型，只保留容器类节点
+        if (className.contains("TextView") || 
+            className.contains("ImageView") || 
+            className.contains("Button") || 
+            className.contains("EditText")
+        ) return false
+        
+        val rect = Rect()
+        node.getBoundsInScreen(rect)
+        val w = rect.width()
+        val h = rect.height()
+        // 微信列表项的尺寸特征：宽度接近屏幕宽，高度在 80px ~ 450px 之间
+        if (w < screenWidth * 0.75f || h < 80 || h > 450) return false
+        
+        var textViewCount = 0
+        fun checkChildren(n: AccessibilityNodeInfo) {
+            for (i in 0 until n.childCount) {
+                val child = n.getChild(i) ?: continue
+                try {
+                    val cls = child.className?.toString() ?: ""
+                    if (cls.contains("TextView") || child.text != null) {
+                        textViewCount++
+                    }
+                    if (child.childCount > 0) {
+                        checkChildren(child)
+                    }
+                } finally {
+                    child.recycle()
+                }
+            }
+        }
+        checkChildren(node)
+        
+        // 容器里必须有文本，且不能是滑动列表本身
+        val isScroll = className.contains("ListView") || 
+                      className.contains("RecyclerView") || 
+                      className.contains("ScrollView")
+        return textViewCount >= 1 && !isScroll
     }
 
     /**
@@ -804,14 +868,33 @@ class TouchEngineService : AccessibilityService() {
     private fun parseAccessibilityTree(root: AccessibilityNodeInfo?): List<NavNode> {
         if (root == null) return emptyList()
         val result = mutableListOf<NavNode>()
-        fun traverse(node: AccessibilityNodeInfo) {
+        fun traverse(node: AccessibilityNodeInfo, isParentScrollContainer: Boolean) {
+            val className = node.className?.toString() ?: ""
+            // 判断是否是滚动/列表容器，如果是，绝不能收录为可点击目标，必须无条件向下递归
+            // 新增 node.collectionInfo 权威系统属性检测，绕过所有混淆
+            val isScrollContainer = className.contains("RecyclerView")
+                    || className.contains("ListView")
+                    || className.contains("ScrollView")
+                    || className.contains("GridView")
+                    || className.contains("ViewPager")
+                    || node.isScrollable
+                    || (node.collectionInfo != null)
+
+            // 【核心打捞】自身声明了 clickable，或者是列表容器的直接子节点
+            // 新增系统 collectionItemInfo 打捞和微信特异性 isWeChatListItem 智能匹配
+            val isClickableTarget = node.isClickable 
+                    || (isParentScrollContainer && !isScrollContainer)
+                    || (node.collectionItemInfo != null)
+                    || isWeChatListItem(node)
+
             val rect = Rect()
             node.getBoundsInScreen(rect)
             val area = rect.width() * rect.height()
             val cx = rect.exactCenterX()
             val cy = rect.exactCenterY()
-            if (node.isVisibleToUser
-                && node.isClickable
+            if (!isScrollContainer
+                && node.isVisibleToUser
+                && isClickableTarget
                 && area > 400
                 && area < screenArea * 0.75f
                 && rect.width() > 0 && rect.height() > 0
@@ -821,32 +904,34 @@ class TouchEngineService : AccessibilityService() {
                 && cy > 0f && cy < screenHeight.toFloat()
                 && cx > 0f && cx < screenWidth.toFloat()
             ) {
-                result.add(
-                    NavNode(
-                        bounds      = rect,
-                        description = node.contentDescription?.toString()
-                            ?: node.text?.toString(),
-                        windowId    = node.windowId
+                // 【智能多原子子树探测】
+                if (hasMultipleClickableChildren(node)) {
+                    // 如果该可点击容器下有 >= 2 个独立可点击子节点（如支付宝顶部的扫一扫、收付款组合整行），
+                    // 我们不在此处截断，而是放行并继续向下递归，以收录更细粒度的原子按钮！
+                } else {
+                    // 如果底下只有 0 或 1 个可点击子项（如 QQ、支付宝或微信的聊天列表整行 Item），
+                    // 直接收录 Parent，并 return 截断子树，防止头像、红点等碎片节点产生！
+                    result.add(
+                        NavNode(
+                            bounds      = rect,
+                            description = node.contentDescription?.toString()
+                                ?: node.text?.toString(),
+                            windowId    = node.windowId
+                        )
                     )
-                )
-                // [FIX CHILD DUPE] 找到合法可点击节点后立即返回，不再递归子节点。
-                // 问题：父节点（如QQ整行对话）和其内部小元素（群标签「狂风」、角标"11"）
-                // 都可点击，两者都被收录，导致NavMesh里有大量微小子节点，
-                // 产生"选了根本不存在的节点"的效果，且导航在小元素之间乱跳。
-                // 修复：以父节点为准，不向下探查子树。
-                // 当父节点不满足过滤条件时（如area太小）仍继续递归，确保合法子节点不被漏掉。
-                return
+                    return
+                }
             }
             for (i in 0 until node.childCount) {
                 val child = node.getChild(i) ?: continue
                 try {
-                    traverse(child)
+                    traverse(child, isScrollContainer) // 传递当前节点是否为滚动容器
                 } finally {
                     child.recycle() // [FIX 2] 改为 finally，异常时也能 recycle
                 }
             }
         }
-        traverse(root)
+        traverse(root, false)
         return result
     }
 
@@ -1572,16 +1657,19 @@ class TouchEngineService : AccessibilityService() {
         if (target == null) return
         val root = rootInActiveWindow ?: return
         val native = findNativeNodeByBounds(root, target.bounds)
+        var clicked = false
         if (native != null) {
-            val clicked = native.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+            clicked = native.performAction(AccessibilityNodeInfo.ACTION_CLICK)
             if (!clicked) {
-                // 直接点击失败，向上遍历父节点寻找真正响应点击的容器
+                // 直接点击失败，向上安全遍历父节点寻找真正响应点击的容器（规避 Double-Recycle）
                 var parent = native.parent
                 while (parent != null) {
                     if (parent.isClickable) {
-                        parent.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-                        parent.recycle()
-                        break
+                        clicked = parent.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                        if (clicked) {
+                            parent.recycle()
+                            break
+                        }
                     }
                     val grandParent = parent.parent
                     parent.recycle()
@@ -1591,6 +1679,20 @@ class TouchEngineService : AccessibilityService() {
             native.recycle()
         }
         root.recycle()
+
+        // 【终极手势物理轻触兜底】如果无障碍 ACTION_CLICK 点击完全失败（常见于微信重度定制/混淆的会话列表），
+        // 直接使用系统 dispatchGesture 派发物理中心点的瞬时轻触手势，强行穿透点击！
+        if (!clicked) {
+            val cx = target.bounds.exactCenterX()
+            val cy = target.bounds.exactCenterY()
+            val path = Path().apply {
+                moveTo(cx, cy)
+            }
+            val gesture = GestureDescription.Builder()
+                .addStroke(GestureDescription.StrokeDescription(path, 0L, 50L))
+                .build()
+            dispatchGesture(gesture, null, null)
+        }
     }
 
     private fun findNativeNodeByBounds(
