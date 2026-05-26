@@ -4,6 +4,8 @@ import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
 import android.annotation.SuppressLint
 import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.res.Resources
 import android.graphics.Path
 import android.graphics.PixelFormat
@@ -89,17 +91,34 @@ class TouchEngineService : AccessibilityService() {
     private val currentFocusState = mutableStateOf<NavNode?>(null)
     private val screenWidth  = Resources.getSystem().displayMetrics.widthPixels
     private val screenHeight = Resources.getSystem().displayMetrics.heightPixels
+    private val homePackageName: String? by lazy {
+        val homeIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME)
+        packageManager.resolveActivity(homeIntent, PackageManager.MATCH_DEFAULT_ONLY)
+            ?.activityInfo?.packageName
+    }
 
     // ── 滚动状态（主线程访问，无需加锁）────────────────────
     private var scrollConfig = ScrollConfig()
     private var scrollState  = ScrollState.IDLE   // 当前滚动阶段
     private var edgeCount    = 0                  // 边缘帧计数
     private var edgeDir: ScrollDir? = null        // 当前边缘方向
+    private var rejectedEdgeDir: ScrollDir? = null // 本次持续拉动已判定为无动作的方向
     private var scrollHintJob: Job? = null
     private var scrollBJob:    Job? = null
     // 翻页前焦点位置，用于翻页后就近定位
     private var prevFocusCx  = 0f
     private var prevFocusCy  = 0f
+    // 连续滑动会话：滑动中不更新 NavMesh，松手后以启动位置恢复焦点。
+    private var autoScrollDir: ScrollDir? = null
+    private var autoScrollStartCx = 0f
+    private var autoScrollStartCy = 0f
+    private var autoScrollPackage: String? = null
+    private var autoScrollWindowId: Int? = null
+    private var pendingRefreshAfterAutoScroll = false
+    private var isJoystickSelecting = false
+    private var selectionPackage: String? = null
+    private var pendingRefreshAfterSelection = false
+    private var meshPackage: String? = null
 
     enum class ScrollState { IDLE, HINT, PLAN_B }
     enum class ScrollDir   { UP, DOWN, LEFT, RIGHT }
@@ -143,6 +162,8 @@ class TouchEngineService : AccessibilityService() {
 
     // [FIX 4] NavMesh 异步重建版本号，防止旧的异步结果覆盖最新状态
     private var navMeshVersion = 0
+    private var lastTaobaoParseDiagnostic: String? = null
+    private var lastDouyinParseDiagnostic: String? = null
 
     // =====================================================
     // Service lifecycle
@@ -216,7 +237,7 @@ class TouchEngineService : AccessibilityService() {
      */
     private fun computeScreenFingerprint(): String {
         return try {
-            val root = rootInActiveWindow ?: return ""
+            val root = obtainPrimaryContentRoot() ?: return ""
             val texts = mutableListOf<String>()
             fun traverse(node: AccessibilityNodeInfo, depth: Int) {
                 if (depth > 6 || texts.size >= 25) return
@@ -234,6 +255,75 @@ class TouchEngineService : AccessibilityService() {
             root.recycle()
             texts.sorted().joinToString("|")
         } catch (e: Exception) { "" }
+    }
+
+    private fun obtainPrimaryContentRoot(): AccessibilityNodeInfo? {
+        val sortedWindows = windows?.sortedByDescending { it.layer }.orEmpty()
+        for (window in sortedWindows) {
+            if (window.type != AccessibilityWindowInfo.TYPE_APPLICATION) continue
+            val root = window.root ?: continue
+            if (root.packageName?.toString() == packageName) {
+                root.recycle()
+                continue
+            }
+            return root
+        }
+        val root = rootInActiveWindow ?: return null
+        return if (root.packageName?.toString() == packageName) {
+            root.recycle()
+            null
+        } else {
+            root
+        }
+    }
+
+    private fun keyboardTop(): Int? {
+        val keyboardWindow = windows?.firstOrNull {
+            it.type == AccessibilityWindowInfo.TYPE_INPUT_METHOD
+        } ?: return null
+        val bounds = Rect()
+        keyboardWindow.getBoundsInScreen(bounds)
+        return bounds.top.takeIf { it in 1 until screenHeight }
+    }
+
+    private fun isIgnoredWindowEvent(event: AccessibilityEvent): Boolean {
+        val eventPackage = event.packageName?.toString()
+        if (eventPackage == packageName) return true
+        val eventWindow = windows?.firstOrNull { it.id == event.windowId }
+        if (eventWindow?.type == AccessibilityWindowInfo.TYPE_INPUT_METHOD ||
+            eventWindow?.type == AccessibilityWindowInfo.TYPE_SYSTEM ||
+            eventWindow?.type == AccessibilityWindowInfo.TYPE_ACCESSIBILITY_OVERLAY
+        ) {
+            return true
+        }
+        val contentPackage = activeTargetPackage()
+        return eventPackage != null && contentPackage != null && eventPackage != contentPackage
+    }
+
+    private fun activeTargetPackage(): String? {
+        val root = obtainPrimaryContentRoot() ?: return null
+        return try {
+            root.packageName?.toString()
+        } finally {
+            root.recycle()
+        }
+    }
+
+    private fun isDefaultHomePackage(packageName: CharSequence?): Boolean {
+        val targetPackage = packageName?.toString() ?: return false
+        return targetPackage == homePackageName
+    }
+
+    private fun isDefaultHomeActive(): Boolean = isDefaultHomePackage(activeTargetPackage())
+
+    private fun isTaobaoPackage(packageName: CharSequence?): Boolean {
+        return packageName?.toString()?.contains("taobao", ignoreCase = true) == true
+    }
+
+    private fun isTaobaoActive(): Boolean = isTaobaoPackage(activeTargetPackage())
+
+    private fun isDouyinPackage(packageName: CharSequence?): Boolean {
+        return EdgeInteractionRules.isDouyinPackage(packageName?.toString())
     }
 
     /** 判断可滚动容器是否支持在给定方向上滚动 */
@@ -265,8 +355,9 @@ class TouchEngineService : AccessibilityService() {
                                 className.contains("ViewPager",            ignoreCase = true) ||
                                 className.contains("Workspace",            ignoreCase = true)
         val isVerticalClass   = className.contains("ScrollView", ignoreCase = true) ||
-                                className.contains("ListView",  ignoreCase = true) ||
-                                className.contains("GridView",  ignoreCase = true)
+                                 className.contains("ListView",  ignoreCase = true) ||
+                                 className.contains("GridView",  ignoreCase = true) ||
+                                 className.contains("WebView", ignoreCase = true)
         return when (dir) {
             ScrollDir.UP    -> hasBackward && !isHorizontalClass
             ScrollDir.DOWN  -> hasForward  && !isHorizontalClass
@@ -295,75 +386,251 @@ class TouchEngineService : AccessibilityService() {
         return null
     }
 
-    /**
-     * 查找当前焦点所在的可滚动容器，支持方向隔离。
-     *
-     * [FIX 2] 修复 BFS 队列中间节点泄漏问题。
-     * 原版只 recycle 了 root，BFS 过程中展开的所有中间节点全部泄漏。
-     * 现在每个节点出队后立即处理：不是目标则 recycle；找到目标则清空剩余队列后返回。
-     */
-    private fun findScrollableNode(dir: ScrollDir): AccessibilityNodeInfo? {
-        val root = rootInActiveWindow ?: return null
+    enum class EdgeActionType { NONE, PAGE_FLIP, GESTURE_SCROLL }
+
+    data class EdgeAction(
+        val type: EdgeActionType,
+        val dir: ScrollDir
+    )
+
+    private fun isHorizontalDir(dir: ScrollDir): Boolean {
+        return dir == ScrollDir.LEFT || dir == ScrollDir.RIGHT
+    }
+
+    private fun isVerticalDir(dir: ScrollDir): Boolean {
+        return dir == ScrollDir.UP || dir == ScrollDir.DOWN
+    }
+
+    private fun rectOf(node: AccessibilityNodeInfo): Rect {
+        return Rect().also { node.getBoundsInScreen(it) }
+    }
+
+    private fun overlap(aStart: Int, aEnd: Int, bStart: Int, bEnd: Int): Int {
+        return (minOf(aEnd, bEnd) - maxOf(aStart, bStart)).coerceAtLeast(0)
+    }
+
+    private fun hasSpecificHorizontalAction(node: AccessibilityNodeInfo, dir: ScrollDir): Boolean {
+        val actions = node.actionList.map { it.id }
+        return when (dir) {
+            ScrollDir.LEFT  -> AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_LEFT.id in actions
+            ScrollDir.RIGHT -> AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_RIGHT.id in actions
+            else            -> false
+        }
+    }
+
+    private fun hasGenericScrollAction(node: AccessibilityNodeInfo, dir: ScrollDir): Boolean {
+        val actions = node.actionList.map { it.id }
+        return when (dir) {
+            ScrollDir.LEFT -> AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD in actions
+            ScrollDir.RIGHT -> AccessibilityNodeInfo.ACTION_SCROLL_FORWARD in actions
+            else -> false
+        }
+    }
+
+    private fun isHorizontalPageNode(node: AccessibilityNodeInfo, dir: ScrollDir, focus: NavNode?): Boolean {
+        if (!isHorizontalDir(dir) || !supportsScrollDirection(node, dir)) return false
+        val className = node.className?.toString() ?: ""
+        val rect = rectOf(node)
+        val wideEnough = rect.width() > rect.height() * 1.2f
+        val explicitPageClass =
+            className.contains("ViewPager", ignoreCase = true) ||
+            className.contains("HorizontalScrollView", ignoreCase = true) ||
+            className.contains("Workspace", ignoreCase = true)
+
+        if (explicitPageClass || (hasSpecificHorizontalAction(node, dir) && wideEnough)) return true
+        if (!hasGenericScrollAction(node, dir)) return false
+
+        val isKnownVerticalClass =
+            className.contains("ScrollView", ignoreCase = true) ||
+            className.contains("ListView", ignoreCase = true) ||
+            className.contains("GridView", ignoreCase = true) ||
+            className.contains("WebView", ignoreCase = true)
+        val isHome = isDefaultHomePackage(node.packageName)
+        if (!EdgeInteractionRules.acceptsGenericHorizontalTarget(
+                rect.width(), rect.height(), screenHeight, isKnownVerticalClass, isHome
+            )) {
+            return false
+        }
+        return isHome || (focus != null && isLocallyRelatedToFocus(node, focus))
+    }
+
+    private fun isLocallyRelatedToFocus(candidate: AccessibilityNodeInfo, focus: NavNode): Boolean {
+        if (candidate.windowId != focus.windowId) return false
+        val rect = rectOf(candidate)
+        if (rect.isEmpty) return false
+
+        val focusRect = focus.bounds
+        val focusCx = focus.centerX.toInt()
+        val focusCy = focus.centerY.toInt()
+        val pad = (screenWidth * 0.04f).roundToInt().coerceAtLeast(32)
+        val expanded = Rect(rect).apply { inset(-pad, -pad) }
+        if (expanded.contains(focusCx, focusCy)) return true
+
+        val yOverlap = overlap(rect.top, rect.bottom, focusRect.top, focusRect.bottom)
+        val minHeight = minOf(rect.height(), focusRect.height()).coerceAtLeast(1)
+        val sameRow = yOverlap >= minHeight * 0.45f
+        val centerGap = kotlin.math.abs(rect.exactCenterX() - focus.centerX)
+        return sameRow && centerGap <= screenWidth * 0.45f
+    }
+
+    private fun nodeScoreToFocus(node: AccessibilityNodeInfo, focus: NavNode): Float {
+        val rect = rectOf(node)
+        val dx = rect.exactCenterX() - focus.centerX
+        val dy = rect.exactCenterY() - focus.centerY
+        val containsBonus = if (rect.contains(focus.centerX.toInt(), focus.centerY.toInt())) -screenWidth.toFloat() else 0f
+        return hypot(dx.toDouble(), dy.toDouble()).toFloat() + containsBonus
+    }
+
+    private fun findBestAccessibilityNode(
+        accept: (AccessibilityNodeInfo) -> Boolean,
+        score: (AccessibilityNodeInfo) -> Float
+    ): AccessibilityNodeInfo? {
+        val roots = mutableListOf<AccessibilityNodeInfo>()
+        try {
+            val sortedWindows = windows?.sortedByDescending { it.layer }.orEmpty()
+            if (sortedWindows.isNotEmpty()) {
+                for (window in sortedWindows) {
+                    if (window.type != AccessibilityWindowInfo.TYPE_APPLICATION) continue
+                    val root = window.root ?: continue
+                    if (root.packageName?.toString() == packageName) {
+                        root.recycle()
+                        continue
+                    }
+                    roots.add(root)
+                }
+            } else {
+                val root = obtainPrimaryContentRoot() ?: return null
+                roots.add(root)
+            }
+        } catch (e: Exception) {
+            Log.e("TouchEngine", "collect roots error: ${e.message}")
+            roots.forEach { runCatching { it.recycle() } }
+            return null
+        }
+
+        var bestNode: AccessibilityNodeInfo? = null
+        var bestScore = Float.MAX_VALUE
         val queue = ArrayDeque<AccessibilityNodeInfo>()
-        queue.add(root)
+        queue.addAll(roots)
         try {
             while (queue.isNotEmpty()) {
                 val node = queue.removeFirst()
-                if (node.isScrollable && supportsScrollDirection(node, dir)) {
-                    // 找到目标：先清空队列中剩余节点，再返回
-                    queue.forEach { it.recycle() }
-                    val result = AccessibilityNodeInfo.obtain(node)
-                    node.recycle()
-                    return result
+                if (accept(node)) {
+                    val s = score(node)
+                    if (s < bestScore) {
+                        bestNode?.recycle()
+                        bestNode = AccessibilityNodeInfo.obtain(node)
+                        bestScore = s
+                    }
                 }
-                // 没找到：展开子节点，当前节点 recycle
                 for (i in 0 until node.childCount) {
                     node.getChild(i)?.let { queue.add(it) }
                 }
                 node.recycle()
             }
         } catch (e: Exception) {
-            // 异常时清空所有未 recycle 的节点，防止泄漏
             queue.forEach { runCatching { it.recycle() } }
-            Log.e("TouchEngine", "findScrollableNode error: ${e.message}")
+            bestNode?.recycle()
+            Log.e("TouchEngine", "findBestAccessibilityNode error: ${e.message}")
+            return null
         }
-        return null
+        return bestNode
     }
 
-    /**
-     * 执行方案A（ACTION_SCROLL），返回是否成功。
-     *
-     * [FIX 7] 对于纵向的连续滚动容器（RecyclerView / ListView / ScrollView），
-     * ACTION_SCROLL_FORWARD 每次跳一整页，体验很生硬，看起来像"翻页"。
-     * 这类容器应由方案B的手势滑动来处理，更自然流畅。
-     * 方案A只保留给真正的翻页容器（ViewPager、HorizontalScrollView 等）
-     * 以及横向滚动动作（LEFT / RIGHT）。
-     */
-    private fun tryPlanA(dir: ScrollDir): Boolean {
-        val scrollNode = findScrollableNode(dir) ?: return false
+    private fun findLocalHorizontalPageNode(focus: NavNode, dir: ScrollDir): AccessibilityNodeInfo? {
+        return findBestAccessibilityNode(
+            accept = { node ->
+                isHorizontalPageNode(node, dir, focus) &&
+                    (isDefaultHomePackage(node.packageName) || isLocallyRelatedToFocus(node, focus))
+            },
+            score = { node -> nodeScoreToFocus(node, focus) }
+        )
+    }
 
-        // [FIX 7] 纵向方向下，过滤掉连续滚动容器，交给方案B处理
-        if (dir == ScrollDir.UP || dir == ScrollDir.DOWN) {
-            val className = scrollNode.className?.toString() ?: ""
-            val isContinuousScroller =
-                className.contains("RecyclerView",  ignoreCase = true) ||
-                className.contains("ListView",      ignoreCase = true) ||
-                className.contains("GridView",      ignoreCase = true) ||
-                (className.contains("ScrollView",   ignoreCase = true) &&
-                 !className.contains("HorizontalScrollView", ignoreCase = true))
-            if (isContinuousScroller) {
-                scrollNode.recycle()
-                return false  // 不用方案A，让调用方走方案B手势滑动
+    private fun findAnyHorizontalPageNode(dir: ScrollDir): AccessibilityNodeInfo? {
+        return findBestAccessibilityNode(
+            accept = { node -> isHorizontalPageNode(node, dir, null) },
+            score = { node -> rectOf(node).top.toFloat() }
+        )
+    }
+
+    private fun isMiddleContentFocus(focus: NavNode): Boolean {
+        return focus.centerY > screenHeight * 0.12f && focus.centerY < screenHeight * 0.86f
+    }
+
+    private fun taobaoHorizontalGestureBounds(focus: NavNode): Rect {
+        val halfHeight = maxOf((focus.bounds.height() * 1.5f).roundToInt(), (screenHeight * 0.06f).roundToInt())
+        return Rect(
+            0,
+            (focus.centerY.roundToInt() - halfHeight).coerceAtLeast(0),
+            screenWidth,
+            (focus.centerY.roundToInt() + halfHeight).coerceAtMost(screenHeight)
+        )
+    }
+
+    private fun decideEdgeAction(focus: NavNode, dir: ScrollDir): EdgeAction {
+        if (isHorizontalDir(dir)) {
+            val pageNode = findLocalHorizontalPageNode(focus, dir)
+            pageNode?.recycle()
+            return if (pageNode != null || isDefaultHomeActive() ||
+                (isTaobaoActive() && isMiddleContentFocus(focus))) {
+                EdgeAction(EdgeActionType.PAGE_FLIP, dir)
+            } else {
+                EdgeAction(EdgeActionType.NONE, dir)
             }
         }
 
-        val actionId = getScrollActionId(scrollNode, dir) ?: run {
-            scrollNode.recycle()
-            return false
+        if (isVerticalDir(dir)) {
+            return EdgeAction(EdgeActionType.GESTURE_SCROLL, dir)
         }
-        val success = scrollNode.performAction(actionId)
-        scrollNode.recycle()
-        return success
+
+        return EdgeAction(EdgeActionType.NONE, dir)
+    }
+
+    private fun tryPageFlip(focus: NavNode?, dir: ScrollDir): Boolean {
+        if (!isHorizontalDir(dir)) return false
+        val pageNode = if (focus != null) {
+            findLocalHorizontalPageNode(focus, dir)
+        } else {
+            findAnyHorizontalPageNode(dir)
+        }
+        if (pageNode != null) {
+            val bounds = rectOf(pageNode)
+            val success = getScrollActionId(pageNode, dir)?.let { pageNode.performAction(it) } == true
+            pageNode.recycle()
+            if (success) return true
+            return dispatchHorizontalPageGesture(dir, bounds)
+        }
+        if (focus != null && isTaobaoActive() && isMiddleContentFocus(focus)) {
+            return dispatchHorizontalPageGesture(dir, taobaoHorizontalGestureBounds(focus))
+        }
+        return isDefaultHomeActive() && dispatchHorizontalPageGesture(dir, null)
+    }
+
+    private fun dispatchHorizontalPageGesture(dir: ScrollDir, targetBounds: Rect?): Boolean {
+        if (!isHorizontalDir(dir)) return false
+        val bounds = targetBounds?.takeUnless { it.isEmpty }
+            ?: Rect(0, (screenHeight * 0.12f).roundToInt(), screenWidth, (screenHeight * 0.88f).roundToInt())
+        val left = bounds.left + bounds.width() * 0.22f
+        val right = bounds.left + bounds.width() * 0.78f
+        val y = bounds.exactCenterY()
+        val (startX, endX) = when (dir) {
+            ScrollDir.RIGHT -> Pair(right, left)
+            ScrollDir.LEFT -> Pair(left, right)
+            else -> return false
+        }
+        val gesture = GestureDescription.Builder()
+            .addStroke(
+                GestureDescription.StrokeDescription(
+                    Path().apply {
+                        moveTo(startX, y)
+                        lineTo(endX, y)
+                    },
+                    0L,
+                    scrollConfig.scrollGestureDurationMs
+                )
+            ).build()
+        return dispatchGesture(gesture, null, null)
     }
 
     /** 执行方案B（dispatchGesture 模拟手势），持续调用 */
@@ -391,6 +658,68 @@ class TouchEngineService : AccessibilityService() {
         dispatchGesture(gesture, null, null)
     }
 
+    private fun directionAngle(dir: ScrollDir): Double = when (dir) {
+        ScrollDir.UP -> -90.0
+        ScrollDir.DOWN -> 90.0
+        ScrollDir.LEFT -> 180.0
+        ScrollDir.RIGHT -> 0.0
+    }
+
+    private fun isHoldingAutoScrollDirection(dragX: Float, dragY: Float, maxRadius: Float): Boolean {
+        val dir = autoScrollDir ?: return false
+        return EdgeInteractionRules.isHeldInDirection(
+            expectedAngle = directionAngle(dir),
+            dragX = dragX,
+            dragY = dragY,
+            maxRadius = maxRadius
+        )
+    }
+
+    private fun beginContinuousScroll(focus: NavNode, dir: ScrollDir) {
+        autoScrollDir = dir
+        autoScrollStartCx = focus.centerX
+        autoScrollStartCy = focus.centerY
+        autoScrollPackage = activeTargetPackage()
+        autoScrollWindowId = focus.windowId
+        pendingRefreshAfterAutoScroll = false
+        pendingRefreshAfterSelection = false
+        meshHandler.removeCallbacks(meshRunnable)
+        navMeshVersion++ // 丢弃进入连续滑动前仍在计算的 NavMesh 结果
+        currentFocusState.value = null
+        navEngine.reset()
+        scrollState = ScrollState.PLAN_B
+    }
+
+    private fun isSameAutoScrollTarget(event: AccessibilityEvent): Boolean {
+        val expectedPackage = autoScrollPackage ?: return false
+        if (event.packageName?.toString() != expectedPackage) return false
+        val expectedWindow = autoScrollWindowId ?: return true
+        return event.windowId == expectedWindow || event.windowId < 0
+    }
+
+    private fun isSameSelectionTarget(event: AccessibilityEvent): Boolean {
+        val expectedPackage = selectionPackage ?: return false
+        return event.packageName?.toString() == expectedPackage
+    }
+
+    private fun deferRefreshUntilSelectionEnds() {
+        if (pendingRefreshAfterSelection) return
+        pendingRefreshAfterSelection = true
+        meshHandler.removeCallbacks(meshRunnable)
+        if (currentNodes.isNotEmpty()) {
+            navMeshVersion++ // 已有可用图时，本次手势不允许动态结果覆盖它
+        }
+    }
+
+    private fun refreshAfterSelectionIfNeeded() {
+        if (!pendingRefreshAfterSelection || scrollState == ScrollState.PLAN_B) return
+        pendingRefreshAfterSelection = false
+        isWindowSettled = false
+        stateChangedTimeMs = System.currentTimeMillis()
+        meshHandler.removeCallbacks(meshRunnable)
+        meshHandler.postDelayed(meshRunnable, DEBOUNCE_DETECT_MS)
+    }
+
     /**
      * 处理边缘检测结果（在 onDrag 结果为 atEdge=true 时调用）。
      *
@@ -398,38 +727,52 @@ class TouchEngineService : AccessibilityService() {
      *   - 方案A不再立即执行，统一走倒计时，防止悬浮球一碰边缘就翻页
      *   - 新增方向锁死：翻页后 1.5s 内封锁反向翻页，防止乒乓跳页
      */
-    private fun handleEdge(dir: ScrollDir, ratio: Float) {
+    private fun handleEdge(focus: NavNode, dir: ScrollDir, ratio: Float) {
         if (!scrollConfig.autoScrollEnabled) return
         if (ratio < 0.28f) return
-
-        // [FIX 9] 方向锁：翻页后短时间内封锁反向，防止立即翻回
-        val lockedDir = when (lastFlipDir) {
-            ScrollDir.LEFT  -> ScrollDir.RIGHT
-            ScrollDir.RIGHT -> ScrollDir.LEFT
-            ScrollDir.UP    -> ScrollDir.DOWN
-            ScrollDir.DOWN  -> ScrollDir.UP
-            null            -> null
-        }
-        if (lockedDir == dir && System.currentTimeMillis() - lastFlipTimeMs < FLIP_LOCK_MS) return
-
-        // [FIX CIRCULAR] 若当前页面在该方向已被标记为循环死胡同，直接跳过
-        if (circularDeadEnds[currentPageFp]?.contains(dir) == true) return
+        if (rejectedEdgeDir == dir) return
 
         if (dir == edgeDir) {
             edgeCount++
         } else {
+            cancelScroll()
             edgeDir   = dir
             edgeCount = 1
-            cancelScroll()
         }
 
         if (edgeCount >= scrollConfig.edgeTriggerFrames) {
             edgeCount = 0
+            val action = decideEdgeAction(focus, dir)
+            if (action.type == EdgeActionType.NONE) {
+                rejectedEdgeDir = dir
+                edgeDir = null
+                return
+            }
+
+            // Only real page flips are blocked by flip history.
+            val lockedDir = when (lastFlipDir) {
+                ScrollDir.LEFT  -> ScrollDir.RIGHT
+                ScrollDir.RIGHT -> ScrollDir.LEFT
+                ScrollDir.UP    -> ScrollDir.DOWN
+                ScrollDir.DOWN  -> ScrollDir.UP
+                null            -> null
+            }
+            if (action.type == EdgeActionType.PAGE_FLIP &&
+                lockedDir == dir && System.currentTimeMillis() - lastFlipTimeMs < FLIP_LOCK_MS) {
+                rejectedEdgeDir = dir
+                edgeDir = null
+                return
+            }
+            if (action.type == EdgeActionType.PAGE_FLIP &&
+                circularDeadEnds[currentPageFp]?.contains(dir) == true) {
+                rejectedEdgeDir = dir
+                edgeDir = null
+                return
+            }
+
             prevFocusCx = currentFocusState.value?.centerX ?: 0f
             prevFocusCy = currentFocusState.value?.centerY ?: 0f
-            // [FIX 9] 方案A不再立即执行，直接走倒计时
-            // 倒计时结束时由 startPlanB 判断：翻页容器→方案A，连续滚动容器→方案B
-            startHint(dir)
+            startHint(focus, action)
         }
     }
 
@@ -437,9 +780,11 @@ class TouchEngineService : AccessibilityService() {
      * 处理点拨到边缘（onRelease 时 atEdge=true 且推力足够）。
      * 快速点拨仍直接走方案A（翻页），不需要倒计时。
      */
-    private fun handleFlickEdge(dir: ScrollDir, ratio: Float) {
+    private fun handleFlickEdge(focus: NavNode, dir: ScrollDir, ratio: Float) {
         if (!scrollConfig.autoScrollEnabled) return
         if (ratio < 0.5f) return
+        val action = decideEdgeAction(focus, dir)
+        if (action.type != EdgeActionType.PAGE_FLIP) return
         // 方向锁同样适用于点拨
         val lockedDir = when (lastFlipDir) {
             ScrollDir.LEFT  -> ScrollDir.RIGHT
@@ -453,7 +798,8 @@ class TouchEngineService : AccessibilityService() {
         if (circularDeadEnds[currentPageFp]?.contains(dir) == true) return
         prevFocusCx = currentFocusState.value?.centerX ?: 0f
         prevFocusCy = currentFocusState.value?.centerY ?: 0f
-        if (tryPlanA(dir)) {
+        prePlanAFp = computeScreenFingerprint()
+        if (tryPageFlip(focus, dir)) {
             lastFlipDir    = dir
             lastFlipTimeMs = System.currentTimeMillis()
             edgeCount = 0; edgeDir = null
@@ -462,45 +808,28 @@ class TouchEngineService : AccessibilityService() {
     }
 
     /**
-     * 预判断即将触发的操作类型（翻页 or 滑动），用于提示文字显示。
-     * 逻辑与 tryPlanA 的过滤条件对称：能翻页的返回 PAGE_FLIP，否则 SCROLL。
-     */
-    private fun detectHintType(dir: ScrollDir): HintType {
-        val scrollNode = findScrollableNode(dir) ?: return HintType.SCROLL
-        val className  = scrollNode.className?.toString() ?: ""
-        scrollNode.recycle()
-        // 纵向连续滚动容器 → 滑动
-        if (dir == ScrollDir.UP || dir == ScrollDir.DOWN) {
-            val isContinuousScroller =
-                className.contains("RecyclerView",  ignoreCase = true) ||
-                className.contains("ListView",      ignoreCase = true) ||
-                className.contains("GridView",      ignoreCase = true) ||
-                (className.contains("ScrollView",   ignoreCase = true) &&
-                 !className.contains("HorizontalScrollView", ignoreCase = true))
-            if (isContinuousScroller) return HintType.SCROLL
-        }
-        return HintType.PAGE_FLIP
-    }
-
-    /**
      * 显示提示气泡并开始倒计时，倒计时结束后进入执行阶段。
      *
      * [FIX 9] 预先检测操作类型，让提示文字告知用户即将翻页还是滑动。
      */
-    private fun startHint(dir: ScrollDir) {
+    private fun startHint(focus: NavNode, action: EdgeAction) {
         if (scrollState != ScrollState.IDLE) return
         scrollState = ScrollState.HINT
         // 提前判断类型，提示条上显示 "即将翻页" 或 "即将滑动"
-        val hintType = detectHintType(dir)
+        val hintType = when (action.type) {
+            EdgeActionType.PAGE_FLIP -> HintType.PAGE_FLIP
+            EdgeActionType.GESTURE_SCROLL -> HintType.SCROLL
+            EdgeActionType.NONE -> return
+        }
         scrollHintJob?.cancel()
         scrollHintJob = serviceScope.launch {
             val startMs = System.currentTimeMillis()
             while (true) {
                 val elapsed  = System.currentTimeMillis() - startMs
                 val progress = (elapsed.toFloat() / scrollConfig.hintDurationMs).coerceAtMost(1f)
-                scrollHintState.value = ScrollHintData(dir, progress, hintType)
+                scrollHintState.value = ScrollHintData(action.dir, progress, hintType)
                 if (progress >= 1f) {
-                    startPlanB(dir)
+                    startEdgeAction(focus, action)
                     return@launch
                 }
                 delay(16)
@@ -516,31 +845,34 @@ class TouchEngineService : AccessibilityService() {
      *   - 连续滚动容器（RecyclerView等）→ 持续手势滑动（方案B）
      *   - 无可滚动容器 → 仍尝试手势（可能对 WebView 等有效）
      */
-    private fun startPlanB(dir: ScrollDir) {
+    private fun startEdgeAction(focus: NavNode, action: EdgeAction) {
         scrollHintState.value = null
         scrollBJob?.cancel()
-        val timeoutAt = System.currentTimeMillis() + 30_000L
         scrollBJob = serviceScope.launch {
-            // [FIX CIRCULAR] 翻页前保存当前页面指纹，用于 afterScroll 中对比
-            prePlanAFp = computeScreenFingerprint()
             // 先试方案A（翻页），倒计时结束时执行
-            if (tryPlanA(dir)) {
+            if (action.type == EdgeActionType.PAGE_FLIP) {
+                prePlanAFp = computeScreenFingerprint()
+            }
+            if (action.type == EdgeActionType.PAGE_FLIP && tryPageFlip(focus, action.dir)) {
                 // [FIX 9] 记录翻页方向和时间，用于方向锁
-                lastFlipDir    = dir
+                lastFlipDir    = action.dir
                 lastFlipTimeMs = System.currentTimeMillis()
                 scrollState = ScrollState.IDLE
                 meshHandler.postDelayed({ afterScroll(prevFocusCx, prevFocusCy) }, 400L)
                 return@launch
             }
             // 方案A无效（连续滚动容器）→ 持续手势滑动
-            scrollState = ScrollState.PLAN_B
-            while (scrollState == ScrollState.PLAN_B
-                   && System.currentTimeMillis() < timeoutAt) {
-                doPlanBGesture(dir)
+            if (action.type != EdgeActionType.GESTURE_SCROLL) {
+                scrollState = ScrollState.IDLE
+                return@launch
+            }
+            beginContinuousScroll(focus, action.dir)
+            while (scrollState == ScrollState.PLAN_B && liveEnabled.value) {
+                doPlanBGesture(action.dir)
                 delay(scrollConfig.scrollGestureDurationMs + 50)
             }
             if (scrollState == ScrollState.PLAN_B) {
-                scrollState = ScrollState.IDLE
+                stopPlanB()
             }
         }
     }
@@ -552,35 +884,48 @@ class TouchEngineService : AccessibilityService() {
      * 新函数统一处理两种状态，防止 PLAN_B 在焦点跳转时无法停止。
      */
     private fun cancelScroll() {
+        if (scrollState == ScrollState.PLAN_B) {
+            stopPlanB()
+            return
+        }
         scrollHintJob?.cancel()
         scrollBJob?.cancel()
         scrollState = ScrollState.IDLE
         scrollHintState.value = null
         edgeCount = 0
         edgeDir = null
+        rejectedEdgeDir = null
     }
 
     /**
-     * 方案B松手：触发惯性后停止。
-     *
-     * [FIX 1] 使用 serviceScope。
-     * [FIX 3] 修复原版先清空 edgeDir 再读取导致惯性手势永远不执行的 Bug：
-     *          现在先将 edgeDir 保存到局部变量 dir，再清空字段。
+     * 连续滑动结束：停止派发手势，并在最新内容上恢复邻近焦点。
      */
-    private fun stopPlanB() {
+    private fun stopPlanB(refreshNodes: Boolean = true) {
         if (scrollState != ScrollState.PLAN_B) return
-        val dir = edgeDir  // [FIX 3] 先读，再清；原版先清后读，dir 永远是 null
+        val restoreCx = autoScrollStartCx
+        val restoreCy = autoScrollStartCy
         scrollBJob?.cancel()
         scrollState = ScrollState.IDLE
         scrollHintState.value = null
         edgeCount = 0
         edgeDir = null
-        // 惯性：再执行一次手势后重建 NavMesh
-        serviceScope.launch {
-            delay(scrollConfig.scrollGestureDurationMs / 2)
-            if (dir != null) doPlanBGesture(dir)
-            delay(200)
-            meshHandler.post { rebuildNavMesh() }
+        rejectedEdgeDir = null
+        autoScrollDir = null
+        autoScrollPackage = null
+        autoScrollWindowId = null
+        val refreshDelay = if (pendingRefreshAfterAutoScroll) DEBOUNCE_DETECT_MS else 0L
+        pendingRefreshAfterAutoScroll = false
+        if (refreshNodes) {
+            isWindowSettled = false
+            stateChangedTimeMs = System.currentTimeMillis()
+            meshHandler.removeCallbacks(meshRunnable)
+            meshHandler.postDelayed({
+                rebuildNavMesh(forceApply = true) { nodes ->
+                    currentFocusState.value = nodes.minByOrNull { n ->
+                        hypot((n.centerX - restoreCx).toDouble(), (n.centerY - restoreCy).toDouble())
+                    }
+                }
+            }, refreshDelay)
         }
     }
 
@@ -597,7 +942,7 @@ class TouchEngineService : AccessibilityService() {
         val savedFp = prePlanAFp   // 翻页前页面指纹
         val flipDir = lastFlipDir  // 翻页方向（回调内可能被重置）
         prePlanAFp  = ""
-        rebuildNavMesh { newNodes ->
+        rebuildNavMesh(forceApply = true) { newNodes ->
             // [FIX CIRCULAR] 翻页后内容对比：若新页面在历史中出现 → 循环绕回
             if (flipDir != null && savedFp.isNotBlank()) {
                 val newFp = computeScreenFingerprint()
@@ -612,11 +957,11 @@ class TouchEngineService : AccessibilityService() {
                         ScrollDir.UP    -> ScrollDir.DOWN
                         ScrollDir.DOWN  -> ScrollDir.UP
                     }
-                    tryPlanA(reverseDir)  // 自动翻回原页面
+                    tryPageFlip(null, reverseDir)  // 自动翻回原页面
                     meshHandler.postDelayed({
                         currentFocusState.value = null
                         navEngine.reset()
-                        rebuildNavMesh { nodes ->
+                        rebuildNavMesh(forceApply = true) { nodes ->
                             currentPageFp = savedFp  // 指纹回退到翻页前
                             currentFocusState.value = nodes.minByOrNull { n ->
                                 hypot((n.centerX - prevCx).toDouble(),
@@ -647,13 +992,34 @@ class TouchEngineService : AccessibilityService() {
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
+        if (event.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
+            event.eventType != AccessibilityEvent.TYPE_VIEW_SCROLLED &&
+            event.eventType != AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
+        ) return
+        if (isIgnoredWindowEvent(event)) return
         when (event.eventType) {
             AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> {
-                // 整页切换：立即清空焦点状态 + 停止滚动
-                currentFocusState.value = null
-                // 【智能优化】保留 currentNodes 作为新旧页面过渡垫片，绝不暴力清空！
-                navEngine.reset()
-                cancelScroll() // 切页时停止所有滚动状态
+                if (scrollState == ScrollState.PLAN_B && isSameAutoScrollTarget(event)) {
+                    pendingRefreshAfterAutoScroll = true
+                    return
+                }
+                if (isJoystickSelecting) {
+                    if (isSameSelectionTarget(event)) deferRefreshUntilSelectionEnds()
+                    return
+                }
+                if (scrollState == ScrollState.PLAN_B) stopPlanB(refreshNodes = false)
+
+                val changedPackage = event.packageName?.toString()
+                val sameAppUpdate = changedPackage != null &&
+                    changedPackage == meshPackage &&
+                    changedPackage != packageName
+                if (!sameAppUpdate) {
+                    // 只有真正切换应用/窗口目标时才丢弃旧节点。
+                    currentFocusState.value = null
+                    currentNodes = emptyList()
+                    navEngine.reset()
+                }
+                if (scrollState == ScrollState.HINT) cancelScroll()
                 
                 // 激活新窗口动态稳定探测机制
                 isWindowSettled = false
@@ -663,7 +1029,31 @@ class TouchEngineService : AccessibilityService() {
                 meshHandler.removeCallbacks(meshRunnable)
                 meshHandler.postDelayed(meshRunnable, DEBOUNCE_STATE_MS)
             }
+            AccessibilityEvent.TYPE_VIEW_SCROLLED -> {
+                if (scrollState == ScrollState.PLAN_B) {
+                    pendingRefreshAfterAutoScroll = true
+                    return
+                }
+                if (isJoystickSelecting) {
+                    if (isSameSelectionTarget(event)) deferRefreshUntilSelectionEnds()
+                    return
+                }
+                // 手动滑动保持旧节点作为双节点比较基准，刷新后就近校准焦点。
+                if (scrollState == ScrollState.HINT) cancelScroll()
+                isWindowSettled = false
+                stateChangedTimeMs = System.currentTimeMillis()
+                meshHandler.removeCallbacks(meshRunnable)
+                meshHandler.postDelayed(meshRunnable, DEBOUNCE_DETECT_MS)
+            }
             AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> {
+                if (scrollState == ScrollState.PLAN_B) {
+                    pendingRefreshAfterAutoScroll = true
+                    return
+                }
+                if (isJoystickSelecting) {
+                    if (isSameSelectionTarget(event)) deferRefreshUntilSelectionEnds()
+                    return
+                }
                 // 核心智能分流：只有在未稳定，且在切页后的黄金 450ms 内，才允许响应内容改变进行侦测比对
                 if (!isWindowSettled) {
                     val elapsed = System.currentTimeMillis() - stateChangedTimeMs
@@ -689,9 +1079,11 @@ class TouchEngineService : AccessibilityService() {
      *
      * @param onDone 图构建完成后在主线程执行的回调（可选）
      */
-    private fun rebuildNavMesh(onDone: ((List<NavNode>) -> Unit)? = null) {
+    private fun rebuildNavMesh(forceApply: Boolean = false, onDone: ((List<NavNode>) -> Unit)? = null) {
         refreshScrollConfig()
         val version = ++navMeshVersion  // 本次重建的版本号
+        val sampledPackage = activeTargetPackage()
+        val collectStartedAt = System.nanoTime()
 
         // 第一阶段：主线程采集节点
         val rawNodes: List<NavNode>
@@ -701,17 +1093,27 @@ class TouchEngineService : AccessibilityService() {
             Log.e("TouchEngine", "collectNodes error: ${e.message}")
             return
         }
+        val collectMs = (System.nanoTime() - collectStartedAt) / 1_000_000L
 
         // 【智能稳定判定核心】比对可见节点的几何结构、个数及所在窗口ID
         val hasChanged = (rawNodes.size != currentNodes.size) || 
             rawNodes.zip(currentNodes).any { (new, old) -> 
                 new.bounds != old.bounds || new.windowId != old.windowId 
             }
+        if (isTaobaoPackage(sampledPackage)) {
+            Log.d("TouchEngineTaobao", "collect=${collectMs}ms nodes=${rawNodes.size} changed=$hasChanged force=$forceApply")
+        }
+        if (isDouyinPackage(sampledPackage)) {
+            Log.d("TouchEngineDouyin", "collect=${collectMs}ms nodes=${rawNodes.size} changed=$hasChanged force=$forceApply pkg=$sampledPackage")
+        } else if (collectMs >= 16L) {
+            Log.d("TouchEnginePerf", "slowCollect=${collectMs}ms nodes=${rawNodes.size} pkg=$sampledPackage")
+        }
         
-        if (!hasChanged) {
+        if (!forceApply && !hasChanged) {
             // 节点没有发生改变，证明页面已完全稳定（Settled）！
             // 立即标记为稳定状态，日常 CONTENT_CHANGED 自动失效，CPU 进入极致休眠
             isWindowSettled = true
+            meshPackage = sampledPackage ?: meshPackage
             onDone?.invoke(currentNodes)
             return
         }
@@ -720,13 +1122,24 @@ class TouchEngineService : AccessibilityService() {
         serviceScope.launch(Dispatchers.Default) {
             // [FIX 8] 连接距离改为屏幕高度的 45%，适配不同手机分辨率。
             val maxDist = (screenHeight * 0.45f).coerceAtLeast(600f)
+            val buildStartedAt = System.nanoTime()
             NavMeshBuilder.build(rawNodes, maxConnectDist = maxDist)
+            if (isTaobaoPackage(sampledPackage)) {
+                val buildMs = (System.nanoTime() - buildStartedAt) / 1_000_000L
+                Log.d("TouchEngineTaobao", "build=${buildMs}ms nodes=${rawNodes.size}")
+            }
+            if (isDouyinPackage(sampledPackage)) {
+                val buildMs = (System.nanoTime() - buildStartedAt) / 1_000_000L
+                Log.d("TouchEngineDouyin", "build=${buildMs}ms nodes=${rawNodes.size}")
+            }
 
             withContext(Dispatchers.Main.immediate) {
                 // 如果在此期间有更新的重建请求，直接丢弃本次结果
                 if (version != navMeshVersion) return@withContext
 
                 currentNodes = rawNodes
+                isWindowSettled = true
+                meshPackage = sampledPackage ?: meshPackage
 
                 // [FIX 5] 用 20px 中心点容差匹配焦点节点
                 val prevFocus = currentFocusState.value
@@ -737,7 +1150,12 @@ class TouchEngineService : AccessibilityService() {
                             (n.centerY - prevFocus.centerY).toDouble()
                         ) < 20.0
                     }
-                    currentFocusState.value = sameNode
+                    currentFocusState.value = sameNode ?: rawNodes.minByOrNull { n ->
+                        hypot(
+                            (n.centerX - prevFocus.centerX).toDouble(),
+                            (n.centerY - prevFocus.centerY).toDouble()
+                        )
+                    }
                 }
 
                 onDone?.invoke(rawNodes)
@@ -757,25 +1175,23 @@ class TouchEngineService : AccessibilityService() {
         val wins = windows
         if (wins.isNullOrEmpty()) {
             // 兜底：windows 拿不到时退回单窗口模式
-            val root = rootInActiveWindow ?: return emptyList()
-            // 过滤服务自身的悬浮球和高亮窗口
-            if (root.packageName?.toString() == packageName) {
-                root.recycle()
-                return emptyList()
-            }
+            val root = obtainPrimaryContentRoot() ?: return emptyList()
             try { allNodes.addAll(parseAccessibilityTree(root)) }
             finally { root.recycle() }
         } else {
+            val targetPackage = activeTargetPackage()
             val sortedWins = wins.sortedByDescending { it.layer }
             for (window in sortedWins) {
-                // 跳过状态栏、导航栏等系统装饰窗口
-                if (window.type == AccessibilityWindowInfo.TYPE_SYSTEM) continue
-                // [FIX 4] 跳过输入法窗口，防止键盘节点混入主 NavMesh
-                if (window.type == AccessibilityWindowInfo.TYPE_INPUT_METHOD) continue
+                // 只采集真实应用内容窗口；键盘、系统栏和悬浮层均不进入 NavMesh。
+                if (window.type != AccessibilityWindowInfo.TYPE_APPLICATION) continue
 
                 val root = window.root ?: continue
                 // 【核心修复】跳过当前服务自身的悬浮球和高亮框窗口，避免自干扰和死循环重建
                 if (root.packageName?.toString() == packageName) {
+                    root.recycle()
+                    continue
+                }
+                if (targetPackage != null && root.packageName?.toString() != targetPackage) {
                     root.recycle()
                     continue
                 }
@@ -786,30 +1202,51 @@ class TouchEngineService : AccessibilityService() {
                 }
             }
         }
-        return allNodes
+        return allNodes.distinctBy {
+            "${it.windowId}:${it.bounds.left}:${it.bounds.top}:${it.bounds.right}:${it.bounds.bottom}"
+        }
     }
 
+    private data class SubtreeProbeKey(val nodeHash: Int, val windowId: Int)
+
     /**
-     * 极速探测一个节点下是否包含至少 2 个独立可见的可点击子节点。
+     * 探测一个节点下是否包含至少 2 个独立可见的可点击子节点。
+     * 同一次节点采集内缓存已扫描子树，避免内容密集页面的嵌套候选重复深挖。
      */
-    private fun hasMultipleClickableChildren(node: AccessibilityNodeInfo): Boolean {
-        var count = 0
-        fun check(n: AccessibilityNodeInfo): Boolean {
+    private fun hasMultipleClickableChildren(
+        node: AccessibilityNodeInfo,
+        cache: MutableMap<SubtreeProbeKey, Int>,
+        visitLimit: Int = Int.MAX_VALUE
+    ): Boolean {
+        var remainingVisits = visitLimit
+        fun countCapped(n: AccessibilityNodeInfo): Int {
+            val key = SubtreeProbeKey(n.hashCode(), n.windowId)
+            cache[key]?.let { return it }
+            var count = 0
             for (i in 0 until n.childCount) {
+                if (remainingVisits-- <= 0) return 2
                 val child = n.getChild(i) ?: continue
                 try {
                     if (child.isVisibleToUser && child.isClickable) {
                         count++
-                        if (count >= 2) return true
+                        if (count >= 2) {
+                            cache[key] = 2
+                            return 2
+                        }
                     }
-                    if (check(child)) return true
+                    count += countCapped(child)
+                    if (count >= 2) {
+                        cache[key] = 2
+                        return 2
+                    }
                 } finally {
                     child.recycle()
                 }
             }
-            return false
+            cache[key] = count
+            return count
         }
-        return check(node)
+        return countCapped(node) >= 2
     }
 
     /**
@@ -859,6 +1296,93 @@ class TouchEngineService : AccessibilityService() {
         return textViewCount >= 1 && !isScroll
     }
 
+    private data class TaobaoSemanticCandidate(
+        val node: NavNode,
+        val band: EdgeInteractionRules.TaobaoContentBand,
+        val insideScrollContent: Boolean
+    )
+
+    private fun selectDouyinSearchFallbackNodes(
+        candidates: List<NavNode>,
+        existingNodes: List<NavNode>
+    ): List<NavNode> {
+        val fallback = mutableListOf<NavNode>()
+        for (candidate in candidates.sortedWith(compareBy({ it.centerY }, { it.centerX }))) {
+            if (fallback.size >= 18) break
+            val cx = candidate.centerX.roundToInt()
+            val cy = candidate.centerY.roundToInt()
+            val covered = existingNodes.any { it.bounds.contains(cx, cy) } ||
+                fallback.any {
+                    hypot(
+                        (it.centerX - candidate.centerX).toDouble(),
+                        (it.centerY - candidate.centerY).toDouble()
+                    ) < 28.0
+                }
+            if (!covered) fallback.add(candidate)
+        }
+        return fallback
+    }
+
+    private fun isEligibleTaobaoSemanticBounds(rect: Rect): Boolean {
+        val cx = rect.exactCenterX()
+        val cy = rect.exactCenterY()
+        return rect.width() >= 44 &&
+            rect.height() >= 20 &&
+            rect.width() * rect.height() < screenArea * 0.18f &&
+            cx > 0f && cx < screenWidth.toFloat() &&
+            EdgeInteractionRules.taobaoContentBand(cy, screenHeight) != null
+    }
+
+    /**
+     * 淘宝的不同频道只会在部分内容带暴露标准可点击节点。仅为空洞内容带补入
+     * 少量语义节点，避免顶部按钮掩盖商品区域，也避免正常频道节点翻倍。
+     */
+    private fun selectTaobaoSemanticFallbackNodes(
+        candidates: List<TaobaoSemanticCandidate>,
+        existingNodes: List<NavNode>
+    ): Pair<List<NavNode>, String> {
+        val fallback = mutableListOf<NavNode>()
+        val fineExisting = existingNodes.filter {
+            it.bounds.width() * it.bounds.height() < screenArea * 0.18f
+        }
+        val maxPerBand = 10
+        val reports = mutableListOf<String>()
+
+        for (band in EdgeInteractionRules.TaobaoContentBand.entries) {
+            val regularCount = fineExisting.count {
+                EdgeInteractionRules.taobaoContentBand(it.centerY, screenHeight) == band
+            }
+            val bandCandidates = candidates
+                .filter { it.band == band }
+                .sortedWith(
+                    compareByDescending<TaobaoSemanticCandidate> { it.insideScrollContent }
+                        .thenBy { it.node.centerY }
+                        .thenBy { it.node.centerX }
+                )
+            var added = 0
+            if (EdgeInteractionRules.shouldBackfillTaobaoBand(regularCount, bandCandidates.size)) {
+                for (candidate in bandCandidates) {
+                    if (added >= maxPerBand) break
+                    val cx = candidate.node.centerX.roundToInt()
+                    val cy = candidate.node.centerY.roundToInt()
+                    val covered = fineExisting.any { it.bounds.contains(cx, cy) } ||
+                        fallback.any {
+                            hypot(
+                                (it.centerX - candidate.node.centerX).toDouble(),
+                                (it.centerY - candidate.node.centerY).toDouble()
+                            ) < 28.0
+                        }
+                    if (!covered) {
+                        fallback.add(candidate.node)
+                        added++
+                    }
+                }
+            }
+            reports.add("${band.name.lowercase()}=$regularCount/${bandCandidates.size}/$added")
+        }
+        return Pair(fallback, reports.joinToString(","))
+    }
+
     /**
      * 递归遍历无障碍树，采集可点击节点。
      *
@@ -867,8 +1391,31 @@ class TouchEngineService : AccessibilityService() {
      */
     private fun parseAccessibilityTree(root: AccessibilityNodeInfo?): List<NavNode> {
         if (root == null) return emptyList()
+        val isTaobao = isTaobaoPackage(root.packageName)
+        val isDouyin = isDouyinPackage(root.packageName)
+        val isComplexContent = isTaobao || isDouyin
+        val keyboardBoundary = if (isDouyin) keyboardTop() else null
+        val traversalBudget = EdgeInteractionRules.traversalBudget(isComplexContent)
+        val nodeLimit = EdgeInteractionRules.nodeLimit(isComplexContent)
         val result = mutableListOf<NavNode>()
-        fun traverse(node: AccessibilityNodeInfo, isParentScrollContainer: Boolean) {
+        val subtreeProbeCache = mutableMapOf<SubtreeProbeKey, Int>()
+        val taobaoCandidates = mutableListOf<TaobaoSemanticCandidate>()
+        val douyinCandidates = mutableListOf<NavNode>()
+        val acceptedBounds = mutableSetOf<String>()
+        var visitedNodes = 0
+
+        fun addResult(node: NavNode) {
+            if (result.size >= nodeLimit) return
+            val key = "${node.windowId}:${node.bounds.left}:${node.bounds.top}:${node.bounds.right}:${node.bounds.bottom}"
+            if (acceptedBounds.add(key)) result.add(node)
+        }
+
+        fun traverse(
+            node: AccessibilityNodeInfo,
+            isParentScrollContainer: Boolean,
+            insideScrollContent: Boolean
+        ) {
+            if (++visitedNodes > traversalBudget) return
             val className = node.className?.toString() ?: ""
             // 判断是否是滚动/列表容器，如果是，绝不能收录为可点击目标，必须无条件向下递归
             // 新增 node.collectionInfo 权威系统属性检测，绕过所有混淆
@@ -892,6 +1439,28 @@ class TouchEngineService : AccessibilityService() {
             val area = rect.width() * rect.height()
             val cx = rect.exactCenterX()
             val cy = rect.exactCenterY()
+            val label = node.contentDescription?.toString()?.trim()
+                ?.takeIf { it.isNotBlank() }
+                ?: node.text?.toString()?.trim()?.takeIf { it.isNotBlank() }
+            if (isTaobao && node.isVisibleToUser && isEligibleTaobaoSemanticBounds(rect)) {
+                val band = EdgeInteractionRules.taobaoContentBand(cy, screenHeight)
+                if (label != null && band != null) {
+                    taobaoCandidates.add(
+                        TaobaoSemanticCandidate(
+                            NavNode(rect, label, node.windowId),
+                            band,
+                            insideScrollContent
+                        )
+                    )
+                }
+            }
+            if (isDouyin && node.isVisibleToUser && label != null &&
+                EdgeInteractionRules.acceptsDouyinSearchSemanticTarget(
+                    rect.width(), rect.height(), cy, screenHeight, keyboardBoundary
+                )
+            ) {
+                douyinCandidates.add(NavNode(rect, label, node.windowId))
+            }
             if (!isScrollContainer
                 && node.isVisibleToUser
                 && isClickableTarget
@@ -905,13 +1474,14 @@ class TouchEngineService : AccessibilityService() {
                 && cx > 0f && cx < screenWidth.toFloat()
             ) {
                 // 【智能多原子子树探测】
-                if (hasMultipleClickableChildren(node)) {
+                val visitLimit = if (isComplexContent) 48 else 160
+                if (hasMultipleClickableChildren(node, subtreeProbeCache, visitLimit)) {
                     // 如果该可点击容器下有 >= 2 个独立可点击子节点（如支付宝顶部的扫一扫、收付款组合整行），
                     // 我们不在此处截断，而是放行并继续向下递归，以收录更细粒度的原子按钮！
                 } else {
                     // 如果底下只有 0 或 1 个可点击子项（如 QQ、支付宝或微信的聊天列表整行 Item），
                     // 直接收录 Parent，并 return 截断子树，防止头像、红点等碎片节点产生！
-                    result.add(
+                    addResult(
                         NavNode(
                             bounds      = rect,
                             description = node.contentDescription?.toString()
@@ -925,13 +1495,35 @@ class TouchEngineService : AccessibilityService() {
             for (i in 0 until node.childCount) {
                 val child = node.getChild(i) ?: continue
                 try {
-                    traverse(child, isScrollContainer) // 传递当前节点是否为滚动容器
+                    traverse(
+                        child,
+                        isScrollContainer,
+                        insideScrollContent || isScrollContainer
+                    )
                 } finally {
                     child.recycle() // [FIX 2] 改为 finally，异常时也能 recycle
                 }
             }
         }
-        traverse(root, false)
+        traverse(root, false, false)
+        if (isTaobao) {
+            val (fallback, diagnostic) = selectTaobaoSemanticFallbackNodes(taobaoCandidates, result)
+            fallback.forEach(::addResult)
+            val report = "$diagnostic,total=${result.size},fallback=${fallback.size}"
+            if (report != lastTaobaoParseDiagnostic) {
+                Log.d("TouchEngineTaobao", "bands $report")
+                lastTaobaoParseDiagnostic = report
+            }
+        }
+        if (isDouyin && keyboardBoundary != null) {
+            val fallback = selectDouyinSearchFallbackNodes(douyinCandidates, result)
+            fallback.forEach(::addResult)
+            val report = "imeTop=$keyboardBoundary,regular=${result.size - fallback.size},candidates=${douyinCandidates.size},fallback=${fallback.size},visited=$visitedNodes"
+            if (report != lastDouyinParseDiagnostic) {
+                Log.d("TouchEngineDouyin", "search $report")
+                lastDouyinParseDiagnostic = report
+            }
+        }
         return result
     }
 
@@ -1149,15 +1741,17 @@ class TouchEngineService : AccessibilityService() {
                     awaitEachGesture {
                         val down = awaitFirstDown(requireUnconsumed = false)
                         isPressed = true
+                        isJoystickSelecting = true
+                        selectionPackage = activeTargetPackage()
+                        pendingRefreshAfterSelection = !isWindowSettled
                         edgeTimerJob?.cancel()
 
-                        // 【极致优化：触碰瞬间零卡顿响应】
-                        // 如果当前窗口处于未稳定状态（如切页或滚动后的 450ms 内），手一碰球直接强刷重建以捕获新节点。
-                        // 如果早已稳定（isWindowSettled = true），则直接 0ms 原地利用缓存的 currentNodes 起飞，
-                        // 彻底免去主线程重复遍历无障碍树的几十毫秒卡顿，彻底解决“拉球阻力感/卡顿”的终极痛点！
-                        if (!isWindowSettled) {
-                            meshHandler.removeCallbacks(meshRunnable)
-                            rebuildNavMesh()
+                        // 一次拉球手势使用同一份 NavMesh，避免淘宝动态事件把导航图中途替换掉。
+                        meshHandler.removeCallbacks(meshRunnable)
+                        navMeshVersion++
+                        if (currentNodes.isEmpty()) {
+                            // 缺图时排队预热，避免在按下回调中同步扫描复杂页面并卡住手指反馈。
+                            meshHandler.post(meshRunnable)
                         }
 
                         // 缓存起始节点
@@ -1179,6 +1773,9 @@ class TouchEngineService : AccessibilityService() {
                             do { awaitPointerEvent() }
                             while (awaitPointerEvent().changes.any { it.pressed })
                             isPressed = false
+                            isJoystickSelecting = false
+                            selectionPackage = null
+                            pendingRefreshAfterSelection = false
                             dragStartNode = null
                             return@awaitEachGesture
                         }
@@ -1234,9 +1831,18 @@ class TouchEngineService : AccessibilityService() {
                                         lastDragX   = clampedX
                                         lastDragY   = clampedY
 
+                                        if (scrollState == ScrollState.PLAN_B) {
+                                            if (!isHoldingAutoScrollDirection(clampedX, clampedY, MAX_BALL_OFFSET)) {
+                                                stopPlanB()
+                                                dragStartNode = null
+                                            }
+                                            change.consume()
+                                            continue
+                                        }
+
                                         // 【优化：拖拽中途动态再锚定】若按下瞬间无可用节点（例如在刚切页，网格还在异步重建中）
                                         // 在拖动过程中，一旦 currentNodes 异步重建载入新节点，瞬间补获最近节点，使选择框立刻现形，绝不卡手！
-                                        if (dragStartNode == null && currentFocusState.value == null) {
+                                        if (dragStartNode == null && currentFocusState.value == null && currentNodes.isNotEmpty()) {
                                             dragStartNode = currentNodes.minByOrNull { n ->
                                                 hypot(
                                                     (n.centerX - (windowX + baseSizePx / 2)).toDouble(),
@@ -1272,6 +1878,9 @@ class TouchEngineService : AccessibilityService() {
                                             if (result.atEdge && ratio >= 0.28f && scrollState == ScrollState.IDLE) {
                                                 val escDir  = dirFromAngle(result.intentAngle)
                                                 val nodeY   = result.node.centerY
+                                                val enteringContent =
+                                                    (escDir == ScrollDir.UP && nodeY > screenHeight * 0.82f) ||
+                                                    (escDir == ScrollDir.DOWN && nodeY < screenHeight * 0.18f)
                                                 val escapeNode: NavNode? = when {
                                                     escDir == ScrollDir.UP &&
                                                     nodeY > screenHeight * 0.82f -> {
@@ -1289,11 +1898,16 @@ class TouchEngineService : AccessibilityService() {
                                                     }
                                                     else -> null
                                                 }
-                                                if (escapeNode != null) {
-                                                    currentFocusState.value = escapeNode
-                                                    navEngine.reset()
-                                                    edgeCount = 0; edgeDir = null
+                                                if (enteringContent) {
                                                     edgeHandled = true
+                                                    if (escapeNode != null) {
+                                                        currentFocusState.value = escapeNode
+                                                        navEngine.reset()
+                                                        edgeCount = 0; edgeDir = null
+                                                    } else {
+                                                        // 向内容区移动却暂无内容节点时，等待松手刷新，不能误触发滑动。
+                                                        pendingRefreshAfterSelection = true
+                                                    }
                                                 }
                                             }
 
@@ -1301,7 +1915,7 @@ class TouchEngineService : AccessibilityService() {
                                                 && isRealEdge(result.node, result.intentAngle)
                                                 && scrollState == ScrollState.IDLE) {
                                                 val dir = dirFromAngle(result.intentAngle)
-                                                handleEdge(dir, ratio) // [FIX 1] 无 scope 参数
+                                                handleEdge(result.node, dir, ratio) // [FIX 1] 无 scope 参数
                                             } else if (!result.atEdge) {
                                                 if (result.node !== startNode) {
                                                     edgeCount = 0; edgeDir = null
@@ -1339,6 +1953,8 @@ class TouchEngineService : AccessibilityService() {
                             longPressJob.cancel()
                             isPressed        = false
                             isDraggingWindow = false
+                            isJoystickSelecting = false
+                            selectionPackage = null
                             dragStartNode    = null  // [FIX 5] 手势结束后清空缓存
 
                             if (dragStarted && !longPressTriggered) {
@@ -1364,7 +1980,7 @@ class TouchEngineService : AccessibilityService() {
                                         val ratio = hypot(lastDragX.toDouble(), lastDragY.toDouble()).toFloat() / MAX_BALL_OFFSET
                                         val ang   = Math.toDegrees(kotlin.math.atan2(lastDragY.toDouble(), lastDragX.toDouble()))
                                         if (ratio >= 0.5f && isRealEdge(startNode, ang)) {
-                                            handleFlickEdge(dirFromAngle(ang), ratio)
+                                            handleFlickEdge(startNode, dirFromAngle(ang), ratio)
                                         }
                                     }
                                 }
@@ -1382,6 +1998,7 @@ class TouchEngineService : AccessibilityService() {
                                     }
                                 }
                             }
+                            refreshAfterSelectionIfNeeded()
                             ballOffsetX = 0f
                             ballOffsetY = 0f
                             if (!dragStarted && !longPressTriggered) {
@@ -1655,7 +2272,7 @@ class TouchEngineService : AccessibilityService() {
      */
     private fun performClickOnTarget(target: NavNode?) {
         if (target == null) return
-        val root = rootInActiveWindow ?: return
+        val root = obtainPrimaryContentRoot() ?: return
         val native = findNativeNodeByBounds(root, target.bounds)
         var clicked = false
         if (native != null) {
@@ -1750,3 +2367,7 @@ class TouchEngineService : AccessibilityService() {
         fun performRestore(s: Bundle?)               = savedStateRegistryController.performRestore(s)
     }
 }
+
+
+
+
